@@ -193,18 +193,21 @@ func makeGranularParts(size int64, chunk int64) []part {
 // --------- HTTP/3 вспомогательное ---------
 //
 
-func probeHEAD(ctx context.Context, client *http.Client, url string) (int64, bool, error) {
-    req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+// probeHEAD делает HEAD, возвращая размер, признак диапазонов и ФИНАЛЬНЫЙ URL после редиректов.
+func probeHEAD(ctx context.Context, client *http.Client, rawURL string) (int64, bool, *url.URL, error) {
+    req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
     if err != nil {
-	return -1, false, err
+	return -1, false, nil, err
     }
     req.Header.Set("Alt-Svc", "h3=\":443\"")
     req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
     resp, err := client.Do(req)
     if err != nil {
-	return -1, false, err
+	return -1, false, nil, err
     }
     defer resp.Body.Close()
+
+    finalURL := resp.Request.URL
 
     var size int64 = -1
     if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -213,27 +216,28 @@ func probeHEAD(ctx context.Context, client *http.Client, url string) (int64, boo
 	}
     }
     acceptRanges := strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
-    return size, acceptRanges, nil
+    return size, acceptRanges, finalURL, nil
 }
 
-func probeRange(ctx context.Context, client *http.Client, url string) bool {
-    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// probeRange пробует GET bytes=0-0 и возвращает, поддерживаются ли диапазоны, и финальный URL.
+func probeRange(ctx context.Context, client *http.Client, rawURL string) (bool, *url.URL) {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
     if err != nil {
-	return false
+	return false, nil
     }
     req.Header.Set("Range", "bytes=0-0")
     req.Header.Set("Alt-Svc", "h3=\":443\"")
     req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
     resp, err := client.Do(req)
     if err != nil {
-	return false
+	return false, nil
     }
     defer resp.Body.Close()
-    return resp.StatusCode == http.StatusPartialContent
+    return resp.StatusCode == http.StatusPartialContent, resp.Request.URL
 }
 
-func singleDownload(ctx context.Context, client *http.Client, url string, out *os.File, p *progress) error {
-    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func singleDownload(ctx context.Context, client *http.Client, rawURL string, out *os.File, p *progress) error {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
     if err != nil {
 	return err
     }
@@ -356,7 +360,7 @@ func computeFileMD5(path string) (string, error) {
 }
 
 //
-// --------- main: адаптивное масштабирование потоков + MD5-проверка ---------
+// --------- main: адаптивное масштабирование потоков + MD5-проверка + имя по редиректу ---------
 //
 
 func main() {
@@ -383,21 +387,55 @@ func main() {
 	os.Exit(2)
     }
 
-    rawURL := flag.Arg(0)
-    u, err := url.Parse(rawURL)
+    origRawURL := flag.Arg(0)
+    origU, err := url.Parse(origRawURL)
     if err != nil {
 	fmt.Fprintf(os.Stderr, "invalid URL: %v\n", err)
 	os.Exit(1)
     }
-    if u.Scheme != "https" {
+    if origU.Scheme != "https" {
 	fmt.Fprintf(os.Stderr, "only https:// URLs are supported for HTTP/3\n")
 	os.Exit(1)
     }
 
-    // Имя файла / директория
+    // Контекст
+    ctx := context.Background()
+    if *timeout > 0 {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, *timeout)
+	defer cancel()
+    }
+
+    // HTTP/3 транспорт + клиент
+    tr := &http3.Transport{
+	TLSClientConfig: &tls.Config{
+	    InsecureSkipVerify: *insecure, //nolint:gosec
+	    NextProtos:         []string{"h3"},
+	},
+    }
+    defer tr.Close()
+    client := &http.Client{Transport: tr}
+
+    // HEAD + получаем финальный URL
+    size, acceptRanges, finalURL, headErr := probeHEAD(ctx, client, origU.String())
+    useURL := origU
+    if headErr == nil && finalURL != nil {
+	useURL = finalURL
+    }
+    // Если HEAD не дал диапазоны, попробуем Range 0-0 — тоже получим finalURL на всякий случай
+    if !acceptRanges && size > 0 {
+	if ok, rFinal := probeRange(ctx, client, useURL.String()); ok {
+	    acceptRanges = true
+	    if rFinal != nil {
+		useURL = rFinal
+	    }
+	}
+    }
+
+    // Имя файла / директория — если -o не задан, берём имя из ФИНАЛЬНОГО URL
     filename := *outName
     if filename == "" {
-	filename = defaultFilename(u)
+	filename = defaultFilename(useURL)
     }
     if *outDir != "" {
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -413,6 +451,7 @@ func main() {
 	filename = *outName
     }
 
+    // Размер части
     chunkSize, perr := parseSize(*partSizeStr)
     if perr != nil || chunkSize < 1 {
 	fmt.Fprintf(os.Stderr, "invalid -part-size: %q\n", *partSizeStr)
@@ -428,32 +467,6 @@ func main() {
     }
     if *maxParallel < *minParallel {
 	*maxParallel = *minParallel
-    }
-
-    // Контекст
-    ctx := context.Background()
-    if *timeout > 0 {
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, *timeout)
-	defer cancel()
-    }
-
-    // HTTP/3 транспорт + клиент (один Transport мультиплексирует стримы в одном QUIC-коннекте)
-    tr := &http3.Transport{
-	TLSClientConfig: &tls.Config{
-	    InsecureSkipVerify: *insecure, //nolint:gosec
-	    NextProtos:         []string{"h3"},
-	},
-    }
-    defer tr.Close()
-    client := &http.Client{Transport: tr}
-
-    // HEAD + проверка диапазонов
-    size, acceptRanges, _ := probeHEAD(ctx, client, u.String())
-    if !acceptRanges && size > 0 {
-	if ok := probeRange(ctx, client, u.String()); ok {
-	    acceptRanges = true
-	}
     }
 
     // Файл
@@ -490,7 +503,7 @@ func main() {
 	    fmt.Fprintf(os.Stderr, "info: server does not advertise/allow ranges; falling back to single-stream download.\n")
 	}
 	pw.setWorkers(1)
-	if err := singleDownload(ctx, client, u.String(), out, &pw); err != nil {
+	if err := singleDownload(ctx, client, useURL.String(), out, &pw); err != nil {
 	    pw.print(true)
 	    fmt.Fprintf(os.Stderr, "download error: %v\n", err)
 	    os.Exit(1)
@@ -500,7 +513,7 @@ func main() {
 	fmt.Printf("Saved to: %s\n", filename)
 	// MD5-проверка после одиночной загрузки
 	if !*skipMD5 {
-	    verifyMD5OrWarn(ctx, client, u.String(), filename)
+	    verifyMD5OrWarn(ctx, client, useURL.String(), filename)
 	}
 	return
     }
@@ -539,7 +552,7 @@ func main() {
 		    if !ok {
 			return nil
 		    }
-		    req, err := http.NewRequestWithContext(gctx, http.MethodGet, u.String(), nil)
+		    req, err := http.NewRequestWithContext(gctx, http.MethodGet, useURL.String(), nil)
 		    if err != nil {
 			return err
 		    }
@@ -653,7 +666,7 @@ func main() {
 
     // MD5-проверка после параллельной загрузки
     if !*skipMD5 {
-	verifyMD5OrWarn(ctx, client, u.String(), filename)
+	verifyMD5OrWarn(ctx, client, useURL.String(), filename)
     }
 }
 
@@ -747,4 +760,3 @@ func verifyMD5OrWarn(ctx context.Context, client *http.Client, srcURL, localPath
 	os.Exit(1)
     }
 }
-
