@@ -1,0 +1,98 @@
+name: build-and-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # нужно для создания релиза и загрузки ассетов
+
+concurrency:
+  group: build-and-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.22.x"]
+        os: [linux]
+        arch: [amd64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Print Go env
+        run: go env
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ github.ref_name }}
+        run: |
+          APP=h3get
+          OUT="${APP}-${GOOS}-${GOARCH}${EXT}"
+          mkdir -p dist
+
+          go build -trimpath -ldflags="-s -w" -o "dist/${OUT}" ./...
+          (cd dist && sha256sum "${OUT}" > "${OUT}.sha256")
+          (cd dist && md5sum    "${OUT}" > "${OUT}.md5")
+
+          (cd dist && tar czf "${APP}-${GOOS}-${GOARCH}.tar.gz" "${OUT}" "${OUT}.sha256" "${OUT}.md5")
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.md5
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Collect files
+        id: collect
+        run: |
+          mkdir -p dist
+          find ./artifacts -type f -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" -o -name "*.md5" -print0 | xargs -0 -I{} cp "{}" dist/
+          ls -lh dist
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/*.md5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
