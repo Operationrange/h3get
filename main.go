@@ -10,6 +10,9 @@ import (
     "flag"
     "fmt"
     "io"
+    "math/rand"
+    "mime"
+    "net"
     "net/http"
     "net/url"
     "os"
@@ -17,11 +20,11 @@ import (
     "path/filepath"
     "strconv"
     "strings"
+    "sync"
     "sync/atomic"
     "time"
 
     "github.com/quic-go/quic-go/http3"
-    "golang.org/x/sync/errgroup"
 )
 
 //
@@ -132,6 +135,11 @@ type part struct {
     to   int64 // inclusive
 }
 
+type job struct {
+    p        part
+    attempts int
+}
+
 type offsetWriter struct {
     f   *os.File
     off int64
@@ -190,51 +198,78 @@ func makeGranularParts(size int64, chunk int64) []part {
 }
 
 //
-// --------- HTTP/3 вспомогательное ---------
+// --------- Метаданные: финальный URL, имя, размер, поддержка Range ---------
 //
 
-// probeHEAD делает HEAD, возвращая размер, признак диапазонов и ФИНАЛЬНЫЙ URL после редиректов.
-func probeHEAD(ctx context.Context, client *http.Client, rawURL string) (int64, bool, *url.URL, error) {
-    req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
-    if err != nil {
-	return -1, false, nil, err
-    }
-    req.Header.Set("Alt-Svc", "h3=\":443\"")
-    req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
-    resp, err := client.Do(req)
-    if err != nil {
-	return -1, false, nil, err
-    }
-    defer resp.Body.Close()
-
-    finalURL := resp.Request.URL
-
-    var size int64 = -1
-    if cl := resp.Header.Get("Content-Length"); cl != "" {
-	if v, err := strconv.ParseInt(cl, 10, 64); err == nil && v > 0 {
-	    size = v
-	}
-    }
-    acceptRanges := strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
-    return size, acceptRanges, finalURL, nil
+type meta struct {
+    finalURL     *url.URL
+    size         int64
+    acceptRanges bool
+    cdFilename   string
 }
 
-// probeRange пробует GET bytes=0-0 и возвращает, поддерживаются ли диапазоны, и финальный URL.
-func probeRange(ctx context.Context, client *http.Client, rawURL string) (bool, *url.URL) {
+// fetchMeta делает GET c Range: bytes=0-0, следует редиректам,
+// и извлекает финальный URL, размер, поддержку range и имя из Content-Disposition.
+func fetchMeta(ctx context.Context, client *http.Client, rawURL string) (*meta, error) {
     req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
     if err != nil {
-	return false, nil
+	return nil, err
     }
     req.Header.Set("Range", "bytes=0-0")
     req.Header.Set("Alt-Svc", "h3=\":443\"")
     req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
+
     resp, err := client.Do(req)
     if err != nil {
-	return false, nil
+	return nil, err
     }
     defer resp.Body.Close()
-    return resp.StatusCode == http.StatusPartialContent, resp.Request.URL
+
+    m := &meta{finalURL: resp.Request.URL, size: -1}
+
+    // Имя из Content-Disposition (если есть)
+    if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+	if _, params, err := mime.ParseMediaType(cd); err == nil {
+	    if v, ok := params["filename*"]; ok {
+		if i := strings.Index(v, "''"); i >= 0 && i+2 < len(v) {
+		    raw := v[i+2:]
+		    if dec, derr := url.QueryUnescape(raw); derr == nil && dec != "" {
+			m.cdFilename = dec
+		    }
+		}
+	    }
+	    if m.cdFilename == "" {
+		if v, ok := params["filename"]; ok && v != "" {
+		    m.cdFilename = v
+		}
+	    }
+	}
+    }
+
+    switch resp.StatusCode {
+    case http.StatusPartialContent: // 206
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+	    if slash := strings.LastIndex(cr, "/"); slash >= 0 && slash+1 < len(cr) {
+		if total, err := strconv.ParseInt(cr[slash+1:], 10, 64); err == nil && total > 0 {
+		    m.size = total
+		}
+	    }
+	}
+	m.acceptRanges = true
+    case http.StatusOK: // 200
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+	    if v, err := strconv.ParseInt(cl, 10, 64); err == nil && v > 0 {
+		m.size = v
+	    }
+	}
+	m.acceptRanges = strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
+    }
+    return m, nil
 }
+
+//
+// --------- HTTP/3 helpers ---------
+//
 
 func singleDownload(ctx context.Context, client *http.Client, rawURL string, out *os.File, p *progress) error {
     req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -266,7 +301,7 @@ func singleDownload(ctx context.Context, client *http.Client, rawURL string, out
 }
 
 //
-// --------- MD5: загрузка, парсинг, вычисление, проверка ---------
+// --------- MD5 ---------
 //
 
 func downloadMD5(ctx context.Context, client *http.Client, baseURL string, savePath string) (string, error) {
@@ -293,12 +328,10 @@ func downloadMD5(ctx context.Context, client *http.Client, baseURL string, saveP
 	return "", err
     }
 
-    // Сохраним .md5 рядом с файлом
     if err := os.WriteFile(savePath, buf.Bytes(), 0o644); err != nil {
 	return "", fmt.Errorf("write md5 file: %w", err)
     }
 
-    // Распарсим ожидаемый хэш
     sum := parseMD5Sum(buf.String())
     if sum == "" {
 	return "", fmt.Errorf("cannot parse md5 from %s", md5URL)
@@ -306,10 +339,6 @@ func downloadMD5(ctx context.Context, client *http.Client, baseURL string, saveP
     return sum, nil
 }
 
-// Поддерживаем форматы:
-//   <hex32>
-//   <hex32>  filename
-//   MD5 (filename) = <hex32>
 func parseMD5Sum(s string) string {
     s = strings.TrimSpace(s)
     isHex := func(r rune) bool {
@@ -341,7 +370,7 @@ func computeFileMD5(path string) (string, error) {
     defer f.Close()
 
     h := md5.New()
-    buf := make([]byte, 1<<20) // 1 MiB
+    buf := make([]byte, 1<<20)
     for {
 	n, rerr := f.Read(buf)
 	if n > 0 {
@@ -360,7 +389,48 @@ func computeFileMD5(path string) (string, error) {
 }
 
 //
-// --------- main: адаптивное масштабирование потоков + MD5-проверка + имя по редиректу ---------
+// --------- Retry policy ---------
+//
+
+func isRetryableHTTP(status int) bool {
+    return status == 408 || status == 429 || (status >= 500 && status <= 599)
+}
+
+func isNetErrRetryable(err error) bool {
+    if err == nil {
+	return false
+    }
+    // net.Error with Timeout() true, temporary errors, EOFs on network reads, QUIC idle timeouts etc.
+    var ne net.Error
+    if errorsAs(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+	return true
+    }
+    msg := strings.ToLower(err.Error())
+    if strings.Contains(msg, "timeout") ||
+	strings.Contains(msg, "no recent network activity") ||
+	strings.Contains(msg, "connection reset") ||
+	strings.Contains(msg, "broken pipe") ||
+	strings.Contains(msg, "stream closed") ||
+	strings.Contains(msg, "use of closed network connection") {
+	return true
+    }
+    return false
+}
+
+// Go 1.22 без generics-friendly errors.As wrapper
+func errorsAs(err error, target interface{}) bool {
+    switch t := target.(type) {
+    case *net.Error:
+	if ne, ok := err.(net.Error); ok {
+	    *t = ne
+	    return true
+	}
+    }
+    return false
+}
+
+//
+// --------- main ---------
 //
 
 func main() {
@@ -380,10 +450,14 @@ func main() {
 
     skipMD5 := flag.Bool("no-md5", false, "do not auto-download and verify .md5 file")
 
+    retries := flag.Int("retries", 5, "max retry attempts per chunk on transient errors")
+    retryBase := flag.Duration("retry-base", 500*time.Millisecond, "base backoff for retries")
+    retryMax := flag.Duration("retry-max", 10*time.Second, "max backoff for retries")
+
     flag.Parse()
 
     if flag.NArg() != 1 {
-	fmt.Fprintf(os.Stderr, "usage: %s [-o out.bin] [-out-dir DIR] [--min-parallel 16] [--max-parallel 1024] [--part-size 8MiB] [--auto] [--auto-interval 1s] [--auto-threshold 0.05] [--no-md5] [--insecure] [--timeout 2m] https://host/path/file\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s [-o out.bin] [-out-dir DIR] [--min-parallel 16] [--max-parallel 1024] [--part-size 8MiB] [--auto] [--auto-interval 1s] [--auto-threshold 0.05] [--no-md5] [--retries 5] [--retry-base 500ms] [--retry-max 10s] [--insecure] [--timeout 2m] https://host/path/file\n", os.Args[0])
 	os.Exit(2)
     }
 
@@ -399,12 +473,14 @@ func main() {
     }
 
     // Контекст
-    ctx := context.Background()
+    baseCtx := context.Background()
     if *timeout > 0 {
 	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, *timeout)
+	baseCtx, cancel = context.WithTimeout(baseCtx, *timeout)
 	defer cancel()
     }
+    ctx, cancelAll := context.WithCancel(baseCtx)
+    defer cancelAll()
 
     // HTTP/3 транспорт + клиент
     tr := &http3.Transport{
@@ -416,26 +492,23 @@ func main() {
     defer tr.Close()
     client := &http.Client{Transport: tr}
 
-    // HEAD + получаем финальный URL
-    size, acceptRanges, finalURL, headErr := probeHEAD(ctx, client, origU.String())
-    useURL := origU
-    if headErr == nil && finalURL != nil {
-	useURL = finalURL
+    // Метаданные
+    m, err := fetchMeta(ctx, client, origU.String())
+    if err != nil {
+	m = &meta{finalURL: origU, size: -1, acceptRanges: false}
     }
-    // Если HEAD не дал диапазоны, попробуем Range 0-0 — тоже получим finalURL на всякий случай
-    if !acceptRanges && size > 0 {
-	if ok, rFinal := probeRange(ctx, client, useURL.String()); ok {
-	    acceptRanges = true
-	    if rFinal != nil {
-		useURL = rFinal
-	    }
-	}
-    }
+    useURL := m.finalURL
+    size := m.size
+    acceptRanges := m.acceptRanges
 
-    // Имя файла / директория — если -o не задан, берём имя из ФИНАЛЬНОГО URL
+    // Имя файла
     filename := *outName
     if filename == "" {
-	filename = defaultFilename(useURL)
+	if m.cdFilename != "" {
+	    filename = m.cdFilename
+	} else {
+	    filename = defaultFilename(useURL)
+	}
     }
     if *outDir != "" {
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -451,14 +524,11 @@ func main() {
 	filename = *outName
     }
 
-    // Размер части
     chunkSize, perr := parseSize(*partSizeStr)
     if perr != nil || chunkSize < 1 {
 	fmt.Fprintf(os.Stderr, "invalid -part-size: %q\n", *partSizeStr)
 	os.Exit(1)
     }
-
-    // Нормализуем границы потоков
     if *minParallel < 1 {
 	*minParallel = 1
     }
@@ -500,7 +570,7 @@ func main() {
     // Фолбэк: одиночная закачка
     if size <= 0 || !acceptRanges {
 	if !acceptRanges {
-	    fmt.Fprintf(os.Stderr, "info: server does not advertise/allow ranges; falling back to single-stream download.\n")
+	    fmt.Fprintf(os.Stderr, "info: server may not allow ranges; falling back to single-stream download.\n")
 	}
 	pw.setWorkers(1)
 	if err := singleDownload(ctx, client, useURL.String(), out, &pw); err != nil {
@@ -511,92 +581,31 @@ func main() {
 	progressCancel()
 	pw.print(true)
 	fmt.Printf("Saved to: %s\n", filename)
-	// MD5-проверка после одиночной загрузки
 	if !*skipMD5 {
 	    verifyMD5OrWarn(ctx, client, useURL.String(), filename)
 	}
 	return
     }
 
-    // Параллельная закачка с адаптивным ростом потоков
+    // Параллельная закачка с ретраями
 
-    // Список мелких частей (гранул)
     parts := makeGranularParts(size, chunkSize)
-
-    // Преаллокация файла
     if err := out.Truncate(size); err != nil {
 	fmt.Fprintf(os.Stderr, "preallocate file failed: %v\n", err)
 	os.Exit(1)
     }
 
     // Очередь задач
-    jobs := make(chan part, 2*(*maxParallel))
-    go func() {
-	for _, p := range parts {
-	    jobs <- p
-	}
-	close(jobs)
-    }()
-
-    // errgroup для воркеров (отменит всех при ошибке одного)
-    eg, gctx := errgroup.WithContext(ctx)
-
-    // Старт воркера (один HTTP/3 запрос = один стрим)
-    startWorker := func(id int) {
-	eg.Go(func() error {
-	    for {
-		select {
-		case <-gctx.Done():
-		    return gctx.Err()
-		case p, ok := <-jobs:
-		    if !ok {
-			return nil
-		    }
-		    req, err := http.NewRequestWithContext(gctx, http.MethodGet, useURL.String(), nil)
-		    if err != nil {
-			return err
-		    }
-		    req.Header.Set("Alt-Svc", "h3=\":443\"")
-		    req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
-		    req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", p.from, p.to))
-
-		    resp, err := client.Do(req)
-		    if err != nil {
-			return fmt.Errorf("worker %d part %d: %w", id, p.idx, err)
-		    }
-		    if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return fmt.Errorf("worker %d part %d unexpected status: %s", id, p.idx, resp.Status)
-		    }
-
-		    bw := bufio.NewWriterSize(&offsetWriter{f: out, off: p.from}, 1<<20)
-		    _, err = io.CopyBuffer(&countingWriter{W: bw, add: func(n int) { pw.add(int64(n)) }},
-			resp.Body, make([]byte, 512*1024))
-		    flushErr := bw.Flush()
-		    closeErr := resp.Body.Close()
-		    if err != nil {
-			return fmt.Errorf("worker %d part %d copy: %w", id, p.idx, err)
-		    }
-		    if flushErr != nil {
-			return fmt.Errorf("worker %d flush: %w", id, flushErr)
-		    }
-		    if closeErr != nil {
-			return fmt.Errorf("worker %d close body: %w", id, closeErr)
-		    }
-		}
-	    }
-	})
+    jobs := make(chan job, 2*(*maxParallel))
+    for _, p := range parts {
+	jobs <- job{p: p, attempts: 0}
     }
 
-    // Запускаем минимум потоков сразу
-    workersStarted := 0
-    for i := 0; i < *minParallel; i++ {
-	startWorker(workersStarted)
-	workersStarted++
-    }
-    pw.setWorkers(workersStarted)
+    // Группы синхронизации
+    var wgParts sync.WaitGroup
+    wgParts.Add(len(parts))
 
-    // Контроллер скоростей: растим число потоков до max-parallel, пока есть заметный прирост
+    // Контроллер скоростей
     var (
 	lastBytes      int64 = 0
 	bestRate             = 0.0
@@ -609,6 +618,139 @@ func main() {
     ctrlCtx, ctrlCancel := context.WithCancel(ctx)
     defer ctrlCancel()
 
+    workersStarted := 0
+    startWorker := func(id int) {
+	pw.setWorkers(id + 1)
+	workersStarted++
+	go func(workerID int) {
+	    buf := make([]byte, 512*1024)
+	    for {
+		select {
+		case <-ctx.Done():
+		    return
+		case j := <-jobs:
+		    // если канал опустел и контекст ещё жив — просто подождём
+		    // чтобы не жечь CPU, проверим nil job
+		    if (j == job{}) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		    }
+		    // попытка скачать кусок
+		    success := false
+		    for {
+			select {
+			case <-ctx.Done():
+			    return
+			default:
+			}
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, useURL.String(), nil)
+			if err != nil {
+			    err = fmt.Errorf("worker %d newreq: %w", workerID, err)
+			} else {
+			    req.Header.Set("Alt-Svc", "h3=\":443\"")
+			    req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
+			    req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", j.p.from, j.p.to))
+
+			    resp, cerr := client.Do(req)
+			    if cerr != nil {
+				err = cerr
+			    } else {
+				// статус
+				if !(resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusOK) {
+				    // retryable по коду?
+				    if isRetryableHTTP(resp.StatusCode) {
+					err = fmt.Errorf("status %s", resp.Status)
+				    } else {
+					// неретраимый — завершим всё скачивание
+					resp.Body.Close()
+					fmt.Fprintf(os.Stderr, "fatal: worker %d part %d unexpected status: %s\n", workerID, j.p.idx, resp.Status)
+					cancelAll()
+					return
+				    }
+				} else {
+				    // пишем кусок
+				    bw := bufio.NewWriterSize(&offsetWriter{f: out, off: j.p.from}, 1<<20)
+				    _, err = io.CopyBuffer(&countingWriter{W: bw, add: func(n int) { pw.add(int64(n)) }},
+					resp.Body, buf)
+				    flushErr := bw.Flush()
+				    closeErr := resp.Body.Close()
+				    if err == nil && flushErr != nil {
+					err = flushErr
+				    }
+				    if err == nil && closeErr != nil {
+					err = closeErr
+				    }
+				    if err == nil {
+					success = true
+				    }
+				}
+			    }
+			}
+
+			if success {
+			    wgParts.Done()
+			    break
+			}
+
+			// ошибка: решаем, ретраить ли
+			retryable := isNetErrRetryable(err) || strings.Contains(strings.ToLower(err.Error()), "eof")
+			if !retryable {
+			    // оставим шанс по коду статуса (в err мог оказаться "status 5xx")
+			    if strings.Contains(err.Error(), "status") {
+				retryable = true
+			    }
+			}
+			if j.attempts >= *retries || !retryable {
+			    // исчерпали попытки — фатал
+			    fmt.Fprintf(os.Stderr, "part %d failed permanently after %d attempts: %v\n", j.p.idx, j.attempts, err)
+			    cancelAll()
+			    return
+			}
+
+			// вычисляем бэкофф
+			backoff := time.Duration(float64(*retryBase) * pow2(j.attempts))
+			if backoff > *retryMax {
+			    backoff = *retryMax
+			}
+			// +/- 20% джиттера
+			jitter := time.Duration((rand.Float64()*0.4 - 0.2) * float64(backoff))
+			backoff = backoff + jitter
+			if backoff < 0 {
+			    backoff = 100 * time.Millisecond
+			}
+			fmt.Fprintf(os.Stderr, "retry part %d (attempt %d): %v, backoff %s\n", j.p.idx, j.attempts+1, err, backoff)
+
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+			    timer.Stop()
+			    return
+			case <-timer.C:
+			}
+			j.attempts++
+			// перекидываем обратно в очередь
+			select {
+			case <-ctx.Done():
+			    return
+			case jobs <- j:
+			    // покидаем внутренний цикл, пусть другой воркер подхватит
+			    goto nextJob
+			}
+		    }
+		nextJob:
+		}
+	    }
+	}(id)
+    }
+
+    // Запускаем минимум потоков сразу
+    for i := 0; i < *minParallel; i++ {
+	startWorker(i)
+    }
+    pw.setWorkers(workersStarted)
+
+    // Контроллер скоростей: растим число потоков до max-parallel, пока есть заметный прирост
     go func() {
 	for {
 	    select {
@@ -630,48 +772,39 @@ func main() {
 		if !*auto {
 		    continue
 		}
-
-		// первая метка — инициализация bestRate
 		if !warmupDone {
 		    bestRate = currentRate
 		    warmupDone = true
 		    continue
 		}
-
-		// Рост при улучшении > threshold
 		threshold := bestRate * (1.0 + *autoThreshold)
 		if currentRate > threshold && workersStarted < *maxParallel {
 		    bestRate = currentRate
 		    startWorker(workersStarted)
-		    workersStarted++
 		    pw.setWorkers(workersStarted)
 		}
 	    }
 	}
     }()
 
-    // Ожидаем завершения всех задач
-    err = eg.Wait()
-    // Останавливаем контроллер и прогресс
-    ctrlCancel()
+    // Ждём завершения всех частей
+    wgParts.Wait()
+
+    // Останавливаем всё
+    cancelAll()
     progressCancel()
     pw.print(true)
 
-    if err != nil {
-	fmt.Fprintf(os.Stderr, "download error: %v\n", err)
-	os.Exit(1)
-    }
-
     fmt.Printf("Saved to: %s\n", filename)
 
-    // MD5-проверка после параллельной загрузки
+    // MD5-проверка
     if !*skipMD5 {
-	verifyMD5OrWarn(ctx, client, useURL.String(), filename)
+	verifyMD5OrWarn(context.Background(), client, useURL.String(), filename)
     }
 }
 
 //
-// --------- Парсинг размеров ---------
+// --------- Вспомогательное ---------
 //
 
 func parseSize(s string) (int64, error) {
@@ -679,7 +812,6 @@ func parseSize(s string) (int64, error) {
     if s == "" {
 	return 0, fmt.Errorf("empty")
     }
-    // чистое число — байты
     if allDigits(s) {
 	v, err := strconv.ParseInt(s, 10, 64)
 	return v, err
@@ -707,7 +839,6 @@ func parseSize(s string) (int64, error) {
 	    return int64(v * float64(u.mul)), nil
 	}
     }
-    // "8K", "16M", "1.5G"
     if strings.HasSuffix(s, "K") || strings.HasSuffix(s, "M") || strings.HasSuffix(s, "G") {
 	base := s[:len(s)-1]
 	mult := int64(1)
@@ -735,6 +866,13 @@ func allDigits(s string) bool {
 	}
     }
     return true
+}
+
+func pow2(n int) float64 {
+    if n <= 0 {
+	return 1
+    }
+    return float64(uint64(1) << uint(n))
 }
 
 //
