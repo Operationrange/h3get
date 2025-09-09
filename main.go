@@ -400,7 +400,6 @@ func isNetErrRetryable(err error) bool {
     if err == nil {
 	return false
     }
-    // net.Error with Timeout() true, temporary errors, EOFs on network reads, QUIC idle timeouts etc.
     var ne net.Error
     if errorsAs(err, &ne) && (ne.Timeout() || ne.Temporary()) {
 	return true
@@ -417,7 +416,7 @@ func isNetErrRetryable(err error) bool {
     return false
 }
 
-// Go 1.22 без generics-friendly errors.As wrapper
+// минималистичный wrapper для errors.As под net.Error (без импорта errors)
 func errorsAs(err error, target interface{}) bool {
     switch t := target.(type) {
     case *net.Error:
@@ -434,6 +433,9 @@ func errorsAs(err error, target interface{}) bool {
 //
 
 func main() {
+    // немного энтропии для джиттера бэкоффа
+    rand.Seed(time.Now().UnixNano())
+
     // Флаги
     outName := flag.String("o", "", "output file name (optional)")
     outDir := flag.String("out-dir", "", "output directory (will be created if missing)")
@@ -595,11 +597,8 @@ func main() {
 	os.Exit(1)
     }
 
-    // Очередь задач
-    jobs := make(chan job, 2*(*maxParallel))
-    for _, p := range parts {
-	jobs <- job{p: p, attempts: 0}
-    }
+    // Очередь задач (не закрываем; ретраи перекидывают обратно)
+    jobs := make(chan job, 4*(*maxParallel))
 
     // Группы синхронизации
     var wgParts sync.WaitGroup
@@ -620,8 +619,8 @@ func main() {
 
     workersStarted := 0
     startWorker := func(id int) {
-	pw.setWorkers(id + 1)
 	workersStarted++
+	pw.setWorkers(workersStarted)
 	go func(workerID int) {
 	    buf := make([]byte, 512*1024)
 	    for {
@@ -629,14 +628,7 @@ func main() {
 		case <-ctx.Done():
 		    return
 		case j := <-jobs:
-		    // если канал опустел и контекст ещё жив — просто подождём
-		    // чтобы не жечь CPU, проверим nil job
-		    if (j == job{}) {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		    }
-		    // попытка скачать кусок
-		    success := false
+		    // обработка одного куска с ретраями
 		    for {
 			select {
 			case <-ctx.Done():
@@ -646,7 +638,7 @@ func main() {
 
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, useURL.String(), nil)
 			if err != nil {
-			    err = fmt.Errorf("worker %d newreq: %w", workerID, err)
+			    // синтетическая ошибка для ретрая
 			} else {
 			    req.Header.Set("Alt-Svc", "h3=\":443\"")
 			    req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
@@ -658,18 +650,15 @@ func main() {
 			    } else {
 				// статус
 				if !(resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusOK) {
-				    // retryable по коду?
 				    if isRetryableHTTP(resp.StatusCode) {
 					err = fmt.Errorf("status %s", resp.Status)
 				    } else {
-					// неретраимый — завершим всё скачивание
 					resp.Body.Close()
 					fmt.Fprintf(os.Stderr, "fatal: worker %d part %d unexpected status: %s\n", workerID, j.p.idx, resp.Status)
 					cancelAll()
 					return
 				    }
 				} else {
-				    // пишем кусок
 				    bw := bufio.NewWriterSize(&offsetWriter{f: out, off: j.p.from}, 1<<20)
 				    _, err = io.CopyBuffer(&countingWriter{W: bw, add: func(n int) { pw.add(int64(n)) }},
 					resp.Body, buf)
@@ -682,38 +671,27 @@ func main() {
 					err = closeErr
 				    }
 				    if err == nil {
-					success = true
+					// успех
+					wgParts.Done()
+					break
 				    }
 				}
 			    }
 			}
 
-			if success {
-			    wgParts.Done()
-			    break
-			}
-
 			// ошибка: решаем, ретраить ли
-			retryable := isNetErrRetryable(err) || strings.Contains(strings.ToLower(err.Error()), "eof")
-			if !retryable {
-			    // оставим шанс по коду статуса (в err мог оказаться "status 5xx")
-			    if strings.Contains(err.Error(), "status") {
-				retryable = true
-			    }
-			}
+			retryable := isNetErrRetryable(err) || strings.Contains(strings.ToLower(err.Error()), "eof") || strings.Contains(err.Error(), "status")
 			if j.attempts >= *retries || !retryable {
-			    // исчерпали попытки — фатал
 			    fmt.Fprintf(os.Stderr, "part %d failed permanently after %d attempts: %v\n", j.p.idx, j.attempts, err)
 			    cancelAll()
 			    return
 			}
 
-			// вычисляем бэкофф
+			// бэкофф с джиттером
 			backoff := time.Duration(float64(*retryBase) * pow2(j.attempts))
 			if backoff > *retryMax {
 			    backoff = *retryMax
 			}
-			// +/- 20% джиттера
 			jitter := time.Duration((rand.Float64()*0.4 - 0.2) * float64(backoff))
 			backoff = backoff + jitter
 			if backoff < 0 {
@@ -729,12 +707,12 @@ func main() {
 			case <-timer.C:
 			}
 			j.attempts++
-			// перекидываем обратно в очередь
+			// отдадим обратно в очередь для любого воркера
 			select {
 			case <-ctx.Done():
 			    return
 			case jobs <- j:
-			    // покидаем внутренний цикл, пусть другой воркер подхватит
+			    // передали на повтор — выходим из внутреннего цикла
 			    goto nextJob
 			}
 		    }
@@ -744,11 +722,21 @@ func main() {
 	}(id)
     }
 
-    // Запускаем минимум потоков сразу
+    // Стартуем минимум потоков
     for i := 0; i < *minParallel; i++ {
 	startWorker(i)
     }
-    pw.setWorkers(workersStarted)
+
+    // Продьюсер частей — отдельно, чтобы не блокировать на большом файле
+    go func() {
+	for _, p := range parts {
+	    select {
+	    case <-ctx.Done():
+		return
+	    case jobs <- job{p: p, attempts: 0}:
+	    }
+	}
+    }()
 
     // Контроллер скоростей: растим число потоков до max-parallel, пока есть заметный прирост
     go func() {
