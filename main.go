@@ -410,7 +410,9 @@ func isNetErrRetryable(err error) bool {
 	strings.Contains(msg, "connection reset") ||
 	strings.Contains(msg, "broken pipe") ||
 	strings.Contains(msg, "stream closed") ||
-	strings.Contains(msg, "use of closed network connection") {
+	strings.Contains(msg, "use of closed network connection") ||
+	strings.Contains(msg, "h3_no_error") || // QUIC idle/clean shutdown -> перезапустим
+	strings.Contains(msg, "h3_request_cancelled") {
 	return true
     }
     return false
@@ -433,7 +435,6 @@ func errorsAs(err error, target interface{}) bool {
 //
 
 func main() {
-    // немного энтропии для джиттера бэкоффа
     rand.Seed(time.Now().UnixNano())
 
     // Флаги
@@ -481,8 +482,7 @@ func main() {
 	baseCtx, cancel = context.WithTimeout(baseCtx, *timeout)
 	defer cancel()
     }
-    ctx, cancelAll := context.WithCancel(baseCtx)
-    defer cancelAll()
+    ctx := baseCtx // без массовой отмены на единичных ошибках
 
     // HTTP/3 транспорт + клиент
     tr := &http3.Transport{
@@ -597,12 +597,19 @@ func main() {
 	os.Exit(1)
     }
 
-    // Очередь задач (не закрываем; ретраи перекидывают обратно)
+    // Очередь задач
     jobs := make(chan job, 4*(*maxParallel))
 
-    // Группы синхронизации
+    // Счётчики завершений
     var wgParts sync.WaitGroup
     wgParts.Add(len(parts))
+    var failedParts int64
+
+    // Как только все части завершены (успех/провал), закрываем канал, чтобы воркеры завершились
+    go func() {
+	wgParts.Wait()
+	close(jobs)
+    }()
 
     // Контроллер скоростей
     var (
@@ -627,7 +634,10 @@ func main() {
 		select {
 		case <-ctx.Done():
 		    return
-		case j := <-jobs:
+		case j, ok := <-jobs:
+		    if !ok {
+			return
+		    }
 		    // обработка одного куска с ретраями
 		    for {
 			select {
@@ -636,27 +646,29 @@ func main() {
 			default:
 			}
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, useURL.String(), nil)
-			if err != nil {
-			    // синтетическая ошибка для ретрая
-			} else {
+			var req *http.Request
+			var err error
+			req, err = http.NewRequestWithContext(ctx, http.MethodGet, useURL.String(), nil)
+			if err == nil {
 			    req.Header.Set("Alt-Svc", "h3=\":443\"")
 			    req.Header.Set("User-Agent", "h3get/auto (+quic-go)")
 			    req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", j.p.from, j.p.to))
 
-			    resp, cerr := client.Do(req)
-			    if cerr != nil {
-				err = cerr
-			    } else {
+			    var resp *http.Response
+			    resp, err = client.Do(req)
+			    if err == nil {
 				// статус
 				if !(resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusOK) {
+                                    // Коды, которые имеет смысл ретраить
 				    if isRetryableHTTP(resp.StatusCode) {
 					err = fmt.Errorf("status %s", resp.Status)
 				    } else {
+					// неретраимый, фиксируем провал части и двигаемся дальше
 					resp.Body.Close()
-					fmt.Fprintf(os.Stderr, "fatal: worker %d part %d unexpected status: %s\n", workerID, j.p.idx, resp.Status)
-					cancelAll()
-					return
+					fmt.Fprintf(os.Stderr, "part %d: unexpected status %s (no retry)\n", j.p.idx, resp.Status)
+					atomic.AddInt64(&failedParts, 1)
+					wgParts.Done()
+					goto nextJob
 				    }
 				} else {
 				    bw := bufio.NewWriterSize(&offsetWriter{f: out, off: j.p.from}, 1<<20)
@@ -673,18 +685,23 @@ func main() {
 				    if err == nil {
 					// успех
 					wgParts.Done()
-					break
+					goto nextJob
 				    }
 				}
 			    }
 			}
 
-			// ошибка: решаем, ретраить ли
-			retryable := isNetErrRetryable(err) || strings.Contains(strings.ToLower(err.Error()), "eof") || strings.Contains(err.Error(), "status")
+			// ошибка — решаем, ретраить?
+			retryable := isNetErrRetryable(err) ||
+			    strings.Contains(strings.ToLower(err.Error()), "eof") ||
+			    strings.Contains(err.Error(), "status")
+
 			if j.attempts >= *retries || !retryable {
+			    // фиксируем провал, НЕ отменяем весь процесс
 			    fmt.Fprintf(os.Stderr, "part %d failed permanently after %d attempts: %v\n", j.p.idx, j.attempts, err)
-			    cancelAll()
-			    return
+			    atomic.AddInt64(&failedParts, 1)
+			    wgParts.Done()
+			    goto nextJob
 			}
 
 			// бэкофф с джиттером
@@ -707,12 +724,11 @@ func main() {
 			case <-timer.C:
 			}
 			j.attempts++
-			// отдадим обратно в очередь для любого воркера
+			// отдадим обратно в очередь
 			select {
 			case <-ctx.Done():
 			    return
 			case jobs <- j:
-			    // передали на повтор — выходим из внутреннего цикла
 			    goto nextJob
 			}
 		    }
@@ -727,7 +743,7 @@ func main() {
 	startWorker(i)
     }
 
-    // Продьюсер частей — отдельно, чтобы не блокировать на большом файле
+    // Продьюсер частей — отдельно, чтобы не блокироваться на большом файле
     go func() {
 	for _, p := range parts {
 	    select {
@@ -778,16 +794,21 @@ func main() {
     // Ждём завершения всех частей
     wgParts.Wait()
 
-    // Останавливаем всё
-    cancelAll()
+    // Останавливаем прогресс и печатаем финал
     progressCancel()
     pw.print(true)
+
+    // Итог
+    if failedParts > 0 {
+	fmt.Fprintf(os.Stderr, "Completed with errors: %d parts failed\n", failedParts)
+	os.Exit(1)
+    }
 
     fmt.Printf("Saved to: %s\n", filename)
 
     // MD5-проверка
     if !*skipMD5 {
-	verifyMD5OrWarn(context.Background(), client, useURL.String(), filename)
+	verifyMD5OrWarn(ctx, client, useURL.String(), filename)
     }
 }
 
@@ -886,3 +907,4 @@ func verifyMD5OrWarn(ctx context.Context, client *http.Client, srcURL, localPath
 	os.Exit(1)
     }
 }
+
