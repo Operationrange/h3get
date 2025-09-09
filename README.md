@@ -1,4 +1,4 @@
-get — HTTP/3 (QUIC) multi-stream downloader
+h3get — HTTP/3 (QUIC) multi-stream downloader
 
 h3get is a blazing-fast command-line downloader that speaks HTTP/3 over QUIC and fully exploits multiplexed streams. It automatically splits a file into ranges and downloads those chunks in parallel over separate HTTP/3 streams on a single QUIC connection. The client adapts the number of streams on the fly to saturate your link, shows live progress (speed, % complete, current streams, ETA), and verifies integrity via an optional .md5 sidecar.
 
